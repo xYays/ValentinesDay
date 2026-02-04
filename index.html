@@ -1,1 +1,808 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Kaitlyn & Angel: Valentine</title>
+  <style>
+    html, body { height: 100%; margin: 0; background:#0b0f19; overflow:hidden; }
+    canvas { display:block; margin:0 auto; image-rendering: pixelated; image-rendering: crisp-edges; }
 
+    #hud{
+      position:fixed; left:14px; bottom:14px;
+      font-family:system-ui, Arial; font-size:14px;
+      color:rgba(255,255,255,.88);
+      background:rgba(0,0,0,.35);
+      border:1px solid rgba(255,255,255,.12);
+      padding:10px 12px; border-radius:12px;
+      backdrop-filter: blur(6px);
+      user-select:none;
+      max-width: 380px;
+    }
+    #hud b { color:#fff; }
+    #status { opacity:.95; }
+
+    /* Choice UI: try again goes UNDER the buttons now */
+    #dialogueUI{
+      position:fixed; left:50%; transform:translateX(-50%);
+      bottom:18px; width:min(860px, calc(100vw - 28px));
+      display:none;
+      font-family:system-ui, Arial;
+      user-select:none;
+    }
+    #choicesPanel{
+      padding:12px;
+      background:rgba(0,0,0,.40);
+      border:1px solid rgba(255,255,255,.12);
+      border-radius:14px;
+      backdrop-filter: blur(8px);
+    }
+    #choicesRow{
+      display:flex; gap:12px; justify-content:center; align-items:center;
+    }
+    .choiceBtn{
+      border:1px solid rgba(255,255,255,.16);
+      background:rgba(255,255,255,.10);
+      color:#fff;
+      border-radius:12px;
+      padding:10px 16px;
+      cursor:pointer;
+      font-weight:900;
+      transition: transform 120ms ease, filter 120ms ease, padding 120ms ease, font-size 120ms ease;
+    }
+    .choiceBtn:hover{ filter:brightness(1.12); transform: translateY(-1px); }
+
+    #tryAgain{
+      display:none;
+      margin-top:10px;
+      text-align:center;
+      color:rgba(255,255,255,.92);
+      font-weight:900;
+      padding:8px 10px;
+      border-radius:12px;
+      background:rgba(255,255,255,.08);
+      border:1px solid rgba(255,255,255,.12);
+    }
+
+    #endOverlay{
+      position:fixed; inset:0;
+      display:none;
+      align-items:center; justify-content:center;
+      background:rgba(0,0,0,.78);
+      color:#fff;
+      font-family:system-ui, Arial;
+      font-size: clamp(36px, 6vw, 96px);
+      font-weight: 950;
+      letter-spacing:2px;
+      user-select:none;
+    }
+
+    /* Optional: a crisp pixel font stack */
+    :root{
+      --pixel-font: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="game" width="960" height="540"></canvas>
+
+  <div id="hud">
+    <b>Controls</b><br>
+    Right-click: move (click-to-move)<br>
+    Left-click: interact (when something glows)<br>
+    <span id="status"></span>
+  </div>
+
+  <div id="dialogueUI">
+    <div id="choicesPanel">
+      <div id="choicesRow">
+        <button id="yesBtn" class="choiceBtn">YES</button>
+        <button id="noBtn" class="choiceBtn">NO</button>
+      </div>
+      <div id="tryAgain">try again.</div>
+    </div>
+  </div>
+
+  <div id="endOverlay">The End</div>
+
+<script>
+(() => {
+  // ===== SETTINGS =====
+  const SETTINGS = {
+    allowLeftClickMove: false,       // LoL movement on right click only
+    internalW: 320, internalH: 180,  // low-res world render
+    bubbleText: "will you be my valentine?"
+  };
+
+  // ===== DOM =====
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+
+  const statusEl = document.getElementById("status");
+  const dialogueUI = document.getElementById("dialogueUI");
+  const yesBtn = document.getElementById("yesBtn");
+  const noBtn = document.getElementById("noBtn");
+  const tryAgainEl = document.getElementById("tryAgain");
+  const endOverlay = document.getElementById("endOverlay");
+
+  // ===== Pixel buffer =====
+  const W = SETTINGS.internalW, H = SETTINGS.internalH;
+  const off = document.createElement("canvas");
+  off.width = W; off.height = H;
+  const octx = off.getContext("2d");
+
+  // ===== Resize =====
+  function resize() {
+    const aspect = canvas.width / canvas.height;
+    const ww = window.innerWidth, wh = window.innerHeight;
+    let w = ww, h = ww / aspect;
+    if (h > wh) { h = wh; w = wh * aspect; }
+    canvas.style.width = w + "px";
+    canvas.style.height = h + "px";
+  }
+  window.addEventListener("resize", resize);
+  resize();
+
+  // Prevent context menu on right click
+  window.addEventListener("contextmenu", (e) => e.preventDefault());
+
+  // ===== Helpers =====
+  const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
+  const dist  = (ax,ay,bx,by) => Math.hypot(ax-bx, ay-by);
+
+  function rectsOverlap(a,b){
+    return !(a.x + a.w <= b.x || a.x >= b.x + b.w || a.y + a.h <= b.y || a.y >= b.y + b.h);
+  }
+
+  function screenToWorld(e){
+    const r = canvas.getBoundingClientRect();
+    const sx = (e.clientX - r.left) / r.width;
+    const sy = (e.clientY - r.top) / r.height;
+    return { x: sx * W, y: sy * H };
+  }
+
+  function normalizeButton(e){
+    if ((e.buttons & 1) === 1) return 0; // left
+    if ((e.buttons & 2) === 2) return 2; // right
+    return e.button ?? 0;
+  }
+
+  // ===== Camera =====
+  const camera = { x:0, y:0 };
+  function follow(ent){
+    camera.x = ent.x + ent.w/2 - W/2;
+    camera.y = ent.y + ent.h/2 - H/2;
+  }
+
+  // ===== UI helpers =====
+  function hideChoices(){
+    dialogueUI.style.display = "none";
+    tryAgainEl.style.display = "none";
+  }
+  function applyYesSize(scale){
+    const basePadX = 16, basePadY = 10;
+    yesBtn.style.padding = `${Math.round(basePadY*scale)}px ${Math.round(basePadX*scale)}px`;
+    yesBtn.style.fontSize = `${Math.round(14*scale)}px`;
+  }
+
+  // ===== Characters =====
+  function makePlayer(){
+    return {
+      name:"Kaitlyn",
+      x:0,y:0,w:10,h:12,
+      speed: 55,
+      target:null,
+      moving:false,
+      canControl:false,
+      pose:"stand",     // stand | sit | hug
+      intro:{ active:true, t:0, phase:0 }
+    };
+  }
+
+  function drawKaitlyn(ctx, p, pose){
+    const hair="#d8b15e", hair2="#b78b3d", skin="#f3caa5", dress="#f2e8f5";
+    ctx.save(); ctx.translate(Math.round(p.x), Math.round(p.y));
+
+    ctx.globalAlpha=.22; ctx.fillStyle="#000";
+    ctx.beginPath(); ctx.ellipse(p.w/2, p.h+2, p.w/2+1, 2, 0, 0, Math.PI*2); ctx.fill();
+    ctx.globalAlpha=1;
+
+    const sit = (pose==="sit"||pose==="hug");
+    const headY = sit ? 2 : 1;
+    const bodyY = sit ? 7 : 6;
+
+    // legs
+    ctx.fillStyle="#caa6a6";
+    if(!sit){ ctx.fillRect(2,p.h-2,2,2); ctx.fillRect(p.w-4,p.h-2,2,2); }
+    else { ctx.fillRect(3,p.h-3,4,2); }
+
+    // dress
+    ctx.fillStyle=dress;
+    ctx.fillRect(1, bodyY, p.w-2, sit?5:6);
+
+    // head
+    ctx.fillStyle=skin;
+    ctx.fillRect(2, headY, p.w-4, 6);
+
+    // hair
+    ctx.fillStyle=hair;
+    ctx.fillRect(1, headY-1, p.w-2, 3);
+    ctx.fillRect(1, headY, 2, 6);
+    ctx.fillRect(p.w-3, headY, 2, 6);
+
+    ctx.fillStyle=hair2;
+    ctx.fillRect(2, headY-1, p.w-4, 1);
+    ctx.fillRect(1, headY+1, 1, 4);
+    ctx.fillRect(p.w-2, headY+1, 1, 4);
+
+    // eyes
+    ctx.fillStyle="#1a1a1a";
+    ctx.fillRect(4, headY+2, 1, 1);
+    ctx.fillRect(p.w-5, headY+2, 1, 1);
+
+    if(pose==="hug"){
+      ctx.fillStyle="rgba(0,0,0,.12)";
+      ctx.fillRect(2, bodyY+2, p.w-4, 2);
+    }
+    ctx.restore();
+  }
+
+  function drawAngel(ctx, a, glow, pose){
+    const hair="#161616", hair2="#2a2a2a", skin="#e9c3a0", hoodie="#f3f3f3";
+    ctx.save(); ctx.translate(Math.round(a.x), Math.round(a.y));
+
+    if(glow>0.01){
+      ctx.globalAlpha = 0.22*glow;
+      ctx.fillStyle="#ffd36a";
+      ctx.fillRect(-8,-8,a.w+16,a.h+16);
+      ctx.globalAlpha=1;
+    }
+
+    ctx.globalAlpha=.22; ctx.fillStyle="#000";
+    ctx.beginPath(); ctx.ellipse(a.w/2, a.h+2, a.w/2+1, 2, 0,0,Math.PI*2); ctx.fill();
+    ctx.globalAlpha=1;
+
+    const sit = (pose==="sit"||pose==="hug");
+    const headY = sit ? 2 : 1;
+    const bodyY = sit ? 7 : 6;
+
+    ctx.fillStyle=hoodie;
+    ctx.fillRect(1, bodyY, a.w-2, sit?5:6);
+
+    ctx.fillStyle=skin;
+    ctx.fillRect(2, headY, a.w-4, 6);
+
+    ctx.fillStyle=hair;
+    for(let i=1;i<a.w-1;i+=2) ctx.fillRect(i, headY-1, 1, 2);
+    ctx.fillRect(1, headY, a.w-2, 2);
+    ctx.fillRect(1, headY+1, 2, 5);
+    ctx.fillRect(a.w-3, headY+1, 2, 5);
+
+    ctx.fillStyle=hair2;
+    ctx.fillRect(2, headY, a.w-4, 1);
+
+    ctx.fillStyle="#111";
+    ctx.fillRect(4, headY+2, 1, 1);
+    ctx.fillRect(a.w-5, headY+2, 1, 1);
+
+    // flowers + chocolates
+    if(sit){
+      ctx.fillStyle="#8cff6a"; ctx.fillRect(2, bodyY+1, 2, 2);
+      ctx.fillStyle="#ff5a7a"; ctx.fillRect(4, bodyY+1, 2, 2);
+      ctx.fillStyle="#ffd36a"; ctx.fillRect(3, bodyY+3, 2, 1);
+      ctx.fillStyle="#4a2b1a"; ctx.fillRect(a.w-5, bodyY+1, 3, 2);
+      ctx.fillStyle="rgba(255,255,255,.20)"; ctx.fillRect(a.w-5, bodyY+1, 3, 1);
+    }
+
+    ctx.restore();
+  }
+
+  // ===== Movement =====
+  function moveWithCollisions(ent, dt, world, colliders){
+    if(!ent.target || !ent.moving) return;
+    const tx=ent.target.x, ty=ent.target.y;
+    const cx=ent.x+ent.w/2, cy=ent.y+ent.h/2;
+    const dx=tx-cx, dy=ty-cy;
+    const d=Math.hypot(dx,dy);
+    if(d<2){ ent.moving=false; return; }
+
+    const vx=(dx/d)*ent.speed, vy=(dy/d)*ent.speed;
+
+    // X
+    let nx = clamp(ent.x + vx*dt, 0, world.w - ent.w);
+    let ny = ent.y;
+    let test = { x:nx, y:ny, w:ent.w, h:ent.h };
+    for(const c of colliders){ if(rectsOverlap(test,c)){ nx=ent.x; break; } }
+
+    // Y
+    ny = clamp(ent.y + vy*dt, 0, world.h - ent.h);
+    test = { x:nx, y:ny, w:ent.w, h:ent.h };
+    for(const c of colliders){ if(rectsOverlap(test,c)){ ny=ent.y; break; } }
+
+    ent.x=nx; ent.y=ny;
+  }
+
+  // ===== Scenes =====
+  class BedroomScene{
+    constructor(player, goTo){
+      this.player=player; this.goTo=goTo;
+      this.world={ w:420, h:260 };
+
+      this.bed={ x:42,y:56,w:44,h:22 };
+      this.desk={ x:245,y:60,w:36,h:16 };
+      this.chair={ x:262,y:80,w:12,h:10 };
+      this.dresser={ x:60,y:178,w:30,h:18 };
+      this.closet={ x:300,y:170,w:52,h:24 };
+      this.carpet={ x:160,y:120,w:85,h:55 };
+      this.colliders=[this.bed,this.desk,this.chair,this.dresser,this.closet];
+
+      this.door={ x:this.world.w-14, y:Math.floor(this.world.h/2)-18, w:10, h:36 };
+      this.doorGlow=0;
+
+      // spawn
+      player.x=this.bed.x+12;
+      player.y=this.bed.y+this.bed.h+2;
+      player.target=null; player.moving=false;
+      player.canControl=false;
+      player.pose="stand";
+      player.intro={ active:true, t:0, phase:0 };
+
+      statusEl.textContent=" | Kaitlyn wakes up...";
+      hideChoices();
+      endOverlay.style.display="none";
+    }
+
+    update(dt){
+      const p=this.player;
+
+      if(p.intro.active){
+        p.intro.t += dt;
+        if(p.intro.phase===0 && p.intro.t>0.45){
+          p.intro.phase=1;
+          statusEl.textContent=" | ...getting out of bed.";
+          p.target={ x:p.x+p.w/2, y:p.y+p.h/2+12 };
+          p.moving=true;
+        }
+        if(p.intro.phase===1){
+          moveWithCollisions(p,dt,this.world,this.colliders);
+          if(!p.moving){
+            p.intro.active=false;
+            p.canControl=true;
+            statusEl.textContent=" | Find the door on the right.";
+          }
+        }
+      } else {
+        moveWithCollisions(p,dt,this.world,this.colliders);
+      }
+
+      const nearDoor = dist(p.x+p.w/2,p.y+p.h/2, this.door.x+this.door.w/2,this.door.y+this.door.h/2) < 28;
+      this.doorGlow += ((nearDoor?1:0) - this.doorGlow) * clamp(dt*10,0,1);
+
+      follow(p);
+      camera.x=clamp(camera.x,0,this.world.w-W);
+      camera.y=clamp(camera.y,0,this.world.h-H);
+    }
+
+    onPointerDown(world, button){
+      const p=this.player;
+
+      // move
+      const moveClick = (button===2) || (SETTINGS.allowLeftClickMove && button===0);
+      if(moveClick){
+        if(!p.canControl) return;
+        p.target={ x:clamp(world.x,0,this.world.w), y:clamp(world.y,0,this.world.h) };
+        p.moving=true;
+        return;
+      }
+
+      // door interact
+      if(button===0){
+        const nearDoor = dist(p.x+p.w/2,p.y+p.h/2, this.door.x+this.door.w/2,this.door.y+this.door.h/2) < 28;
+        if(nearDoor) this.goTo("park"); // instant transition
+      }
+    }
+
+    render(ctx){
+      ctx.fillStyle="#2a2030"; ctx.fillRect(0,0,W,H);
+      const rx=-camera.x, ry=-camera.y;
+
+      ctx.fillStyle="#3a2d42"; ctx.fillRect(rx,ry,this.world.w,this.world.h);
+
+      // carpet
+      ctx.fillStyle="#5b3b67";
+      ctx.fillRect(rx+this.carpet.x, ry+this.carpet.y, this.carpet.w, this.carpet.h);
+
+      function box(o,c){
+        ctx.fillStyle=c; ctx.fillRect(rx+o.x,ry+o.y,o.w,o.h);
+        ctx.strokeStyle="rgba(0,0,0,.35)"; ctx.strokeRect(rx+o.x,ry+o.y,o.w,o.h);
+      }
+      box(this.bed,"#875a6a");
+      ctx.fillStyle="#e7d9e1"; ctx.fillRect(rx+this.bed.x+4, ry+this.bed.y+3, 14, 6);
+
+      box(this.desk,"#7c5c3c");
+      box(this.chair,"#6a4d35");
+      box(this.dresser,"#6a3f2b");
+      box(this.closet,"#3e4a52");
+
+      // door
+      const d=this.door;
+      if(this.doorGlow>0.05){
+        ctx.globalAlpha=0.25*this.doorGlow;
+        ctx.fillStyle="#ffd36a";
+        ctx.fillRect(rx+d.x-6, ry+d.y-6, d.w+12, d.h+12);
+        ctx.globalAlpha=1;
+        statusEl.textContent=" | Door is glowing... left-click it.";
+      }
+      ctx.fillStyle="#2d1d32"; ctx.fillRect(rx+d.x,ry+d.y,d.w,d.h);
+      ctx.fillStyle="#d1b26a"; ctx.fillRect(rx+d.x+d.w-3, ry+d.y+Math.floor(d.h/2), 2, 2);
+
+      drawKaitlyn(ctx, { x:rx+this.player.x, y:ry+this.player.y, w:this.player.w, h:this.player.h }, this.player.pose);
+    }
+  }
+
+  class ParkScene{
+    constructor(player){
+      this.player=player;
+      this.world={ w:600, h:360 };
+
+      this.pond={ x:370,y:250,w:140,h:80 };
+
+      this.trees=[];
+      const treeSpots=[[70,70],[120,90],[170,60],[220,85],[260,60],[520,60],[560,110],[90,340],[140,320],[200,340],[30,210],[560,270],[500,310],[430,80],[470,110]];
+      for(const [x,y] of treeSpots) this.trees.push({x,y,w:18,h:18});
+
+      this.flowers=[];
+      const cols=["#ff5a7a","#ffd36a","#8cff6a","#3ad1ff","#b14cff"];
+      for(let i=0;i<420;i++){
+        this.flowers.push({ x:Math.random()*this.world.w, y:Math.random()*this.world.h, c:cols[(Math.random()*cols.length)|0], s:1+((Math.random()*2)|0) });
+      }
+
+      this.birds=[];
+      for(let i=0;i<9;i++) this.birds.push({ x:60+Math.random()*this.world.w, y:40+Math.random()*130, vx:10+Math.random()*22 });
+
+      this.path=[{x:70,y:300},{x:150,y:260},{x:230,y:230},{x:310,y:210},{x:400,y:200},{x:490,y:180},{x:520,y:140}];
+
+      this.bench={ x:520,y:120,w:40,h:14 };
+      this.angel={ x:this.bench.x+18, y:this.bench.y-2, w:10, h:12 };
+      this.angelGlow=0;
+
+      this.event={
+        stage:"idle", // idle -> approach -> sit -> choice -> hug -> end
+        t:0,
+        bubble:false,      // controls whether we draw the question
+        yesScale:1,
+        noCount:0
+      };
+
+      player.x=80; player.y=300;
+      player.target=null; player.moving=false;
+      player.canControl=true;
+      player.pose="stand";
+
+      hideChoices();
+      endOverlay.style.display="none";
+      statusEl.textContent=" | Follow the path...";
+    }
+
+    colliders(){
+      const pondC={ x:this.pond.x+12, y:this.pond.y+12, w:this.pond.w-24, h:this.pond.h-24 };
+      const benchC={ x:this.bench.x, y:this.bench.y, w:this.bench.w, h:this.bench.h };
+      return [...this.trees, pondC, benchC];
+    }
+
+    beginAngel(){
+      if(this.event.stage!=="idle") return;
+      const p=this.player;
+      p.canControl=false;
+      p.target=null; p.moving=false;
+      this.event.stage="approach";
+      this.event.t=0;
+      this.event.bubble=false;
+      statusEl.textContent=" | ";
+    }
+
+    showChoices(){
+      this.event.stage="choice";
+      this.event.bubble=true;
+      this.event.yesScale=1;
+      this.event.noCount=0;
+      applyYesSize(1);
+      tryAgainEl.style.display="none";
+      dialogueUI.style.display="block";
+    }
+
+    updateEvent(dt){
+      const ev=this.event;
+      const p=this.player;
+
+      if(ev.stage==="approach"){
+        ev.t += dt;
+
+        // fail-safe: always continue even if stuck
+        if(ev.t > 1.2){
+          p.pose="sit";
+          ev.stage="sit";
+          ev.t=0;
+          return;
+        }
+
+        // move to sit spot
+        const sitSpot={ x:this.bench.x+8, y:this.bench.y+3 };
+        if(!p.moving){
+          p.target={ x:sitSpot.x+p.w/2, y:sitSpot.y+p.h/2 };
+          p.moving=true;
+        }
+        moveWithCollisions(p,dt,this.world,this.colliders());
+
+        if(dist(p.x,p.y,sitSpot.x,sitSpot.y) < 2.5){
+          p.moving=false; p.target=null;
+          p.pose="sit";
+          ev.stage="sit";
+          ev.t=0;
+        }
+      }
+
+      if(ev.stage==="sit"){
+        ev.t += dt;
+        if(ev.t > 0.45) this.showChoices();
+      }
+
+      if(ev.stage==="hug"){
+        ev.t += dt;
+        if(ev.t > 1.0){
+          ev.stage="end";
+          endOverlay.style.display="flex";
+          hideChoices();
+          ev.bubble=false;
+        }
+      }
+    }
+
+    update(dt){
+      for(const b of this.birds){
+        b.x += b.vx*dt;
+        if(b.x > this.world.w+40) b.x=-40;
+      }
+
+      if(this.player.canControl){
+        moveWithCollisions(this.player,dt,this.world,this.colliders());
+        this.player.pose="stand";
+      }
+
+      const p=this.player;
+      const nearAngel = dist(p.x+p.w/2,p.y+p.h/2, this.angel.x+this.angel.w/2,this.angel.y+this.angel.h/2) < 55;
+      this.angelGlow += ((nearAngel && this.event.stage==="idle") ? 1 : 0 - this.angelGlow) * clamp(dt*10,0,1);
+
+      if(this.event.stage==="idle" && nearAngel){
+        statusEl.textContent=" | Angel is glowing... left-click him.";
+      }
+
+      this.updateEvent(dt);
+
+      follow(this.player);
+      camera.x=clamp(camera.x,0,this.world.w-W);
+      camera.y=clamp(camera.y,0,this.world.h-H);
+    }
+
+    onPointerDown(world, button){
+      // ignore clicks during UI/end
+      if(this.event.stage==="choice" || this.event.stage==="hug" || this.event.stage==="end") return;
+
+      const p=this.player;
+
+      // move
+      const moveClick = (button===2) || (SETTINGS.allowLeftClickMove && button===0);
+      if(moveClick){
+        if(!p.canControl) return;
+        p.target={ x:clamp(world.x,0,this.world.w), y:clamp(world.y,0,this.world.h) };
+        p.moving=true;
+        return;
+      }
+
+      // interact with Angel by proximity (no tiny hitbox)
+      if(button===0 && this.event.stage==="idle"){
+        const nearAngel = dist(p.x+p.w/2,p.y+p.h/2, this.angel.x+this.angel.w/2,this.angel.y+this.angel.h/2) < 70;
+        if(nearAngel) this.beginAngel();
+      }
+    }
+
+    render(ctx){
+      ctx.fillStyle="#244224"; ctx.fillRect(0,0,W,H);
+      const rx=-camera.x, ry=-camera.y;
+
+      ctx.fillStyle="#2d5b2d"; ctx.fillRect(rx,ry,this.world.w,this.world.h);
+
+      // flowers
+      for(const f of this.flowers){
+        const x=rx+f.x, y=ry+f.y;
+        if(x<-5||y<-5||x>W+5||y>H+5) continue;
+        ctx.fillStyle=f.c;
+        ctx.fillRect(Math.round(x),Math.round(y),f.s,f.s);
+      }
+
+      // path
+      ctx.strokeStyle="rgba(245,230,195,.92)";
+      ctx.lineWidth=6;
+      ctx.beginPath();
+      for(let i=0;i<this.path.length;i++){
+        const p=this.path[i];
+        const x=rx+p.x, y=ry+p.y;
+        if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+      }
+      ctx.stroke();
+
+      // pond
+      ctx.fillStyle="#2c5fa8";
+      ctx.beginPath();
+      ctx.ellipse(rx+this.pond.x+this.pond.w/2, ry+this.pond.y+this.pond.h/2, this.pond.w/2, this.pond.h/2, 0, 0, Math.PI*2);
+      ctx.fill();
+
+      // trees
+      for(const t of this.trees){
+        ctx.fillStyle="#5a3c22";
+        ctx.fillRect(rx+t.x+7, ry+t.y+10, 4, 8);
+        ctx.fillStyle="#163d16";
+        ctx.fillRect(rx+t.x, ry+t.y, t.w, t.h);
+      }
+
+      // birds
+      ctx.fillStyle="rgba(255,255,255,.85)";
+      for(const b of this.birds){
+        const x=rx+b.x, y=ry+b.y;
+        if(x<-10||x>W+10) continue;
+        ctx.fillRect(Math.round(x),Math.round(y),2,1);
+        ctx.fillRect(Math.round(x)+3,Math.round(y)+1,2,1);
+      }
+
+      // bench
+      ctx.fillStyle="#6a4d35";
+      ctx.fillRect(rx+this.bench.x, ry+this.bench.y, this.bench.w, this.bench.h);
+      ctx.fillStyle="#4f3727";
+      ctx.fillRect(rx+this.bench.x+4, ry+this.bench.y+this.bench.h, 4, 4);
+      ctx.fillRect(rx+this.bench.x+this.bench.w-8, ry+this.bench.y+this.bench.h, 4, 4);
+
+      // Angel
+      const angelPose = (this.event.stage==="hug"||this.event.stage==="end") ? "hug" : "sit";
+      drawAngel(ctx, { x:rx+this.angel.x, y:ry+this.angel.y, w:this.angel.w, h:this.angel.h }, this.angelGlow, angelPose);
+
+      // Kaitlyn
+      const kp = (this.event.stage==="hug"||this.event.stage==="end") ? "hug"
+               : (this.event.stage==="sit"||this.event.stage==="choice") ? "sit" : "stand";
+      drawKaitlyn(ctx, { x:rx+this.player.x, y:ry+this.player.y, w:this.player.w, h:this.player.h }, kp);
+    }
+
+    // Provide the anchor point for crisp screen-space speech bubble
+    getAngelBubbleAnchorWorld(){
+      // anchor slightly above Angel's head
+      return { x: this.angel.x + this.angel.w/2, y: this.angel.y - 6 };
+    }
+  }
+
+  // ===== Game setup =====
+  const player = makePlayer();
+  let scene = null;
+
+  function goTo(name){
+    hideChoices();
+    endOverlay.style.display="none";
+    if(name==="bedroom") scene = new BedroomScene(player, goTo);
+    if(name==="park") scene = new ParkScene(player);
+  }
+  goTo("bedroom");
+
+  // ===== Input =====
+  canvas.addEventListener("pointerdown", (e) => {
+    canvas.setPointerCapture?.(e.pointerId);
+    const local = screenToWorld(e);
+    const world = { x: local.x + camera.x, y: local.y + camera.y };
+    const btn = normalizeButton(e);
+    scene.onPointerDown(world, btn);
+  });
+
+  // ===== Choice Buttons =====
+  yesBtn.addEventListener("click", () => {
+    if(!(scene instanceof ParkScene)) return;
+    if(scene.event.stage !== "choice") return;
+    scene.event.stage="hug";
+    scene.event.t=0;
+    scene.event.bubble=false;
+    hideChoices();
+  });
+
+  noBtn.addEventListener("click", () => {
+    if(!(scene instanceof ParkScene)) return;
+    if(scene.event.stage !== "choice") return;
+    scene.event.noCount += 1;
+
+    // show try again under buttons
+    tryAgainEl.style.display="block";
+
+    // grow YES each "no"
+    const scale = 1 + scene.event.noCount * 0.18;
+    scene.event.yesScale = scale;
+    applyYesSize(scale);
+  });
+
+  // ===== Crisp Screen-Space Speech Bubble (fixes blur) =====
+  function drawCrispSpeechBubble(){
+    if(!(scene instanceof ParkScene)) return;
+    if(!scene.event.bubble) return;
+
+    // world -> internal screen coords
+    const a = scene.getAngelBubbleAnchorWorld();
+    const internalX = a.x - camera.x;
+    const internalY = a.y - camera.y;
+
+    // internal -> final canvas pixels
+    const sx = canvas.width / W;
+    const sy = canvas.height / H;
+    const px = Math.round(internalX * sx);
+    const py = Math.round(internalY * sy);
+
+    // bubble size in final pixels (not internal), so text is sharp
+    const bw = Math.round(520 * (canvas.width / 960));  // scales with canvas size
+    const bh = Math.round(64  * (canvas.height / 540));
+    const x = Math.round(px - bw/2);
+    const y = Math.round(py - bh - 18);
+
+    // clamp bubble into screen
+    const cx = clamp(x, 12, canvas.width - bw - 12);
+    const cy = clamp(y, 12, canvas.height - bh - 12);
+
+    ctx.save();
+    ctx.imageSmoothingEnabled = false;
+
+    // bubble panel
+    ctx.globalAlpha = 0.94;
+    ctx.fillStyle = "rgba(0,0,0,0.62)";
+    ctx.fillRect(cx, cy, bw, bh);
+
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = "rgba(255,255,255,0.18)";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(cx + 1, cy + 1, bw - 2, bh - 2);
+
+    // little tail
+    ctx.fillStyle = "rgba(0,0,0,0.62)";
+    ctx.fillRect(px - 6, cy + bh, 12, 10);
+    ctx.strokeStyle = "rgba(255,255,255,0.14)";
+    ctx.strokeRect(px - 6, cy + bh, 12, 10);
+
+    // text (crisp)
+    ctx.fillStyle = "rgba(255,255,255,0.96)";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.font = `bold ${Math.round(22 * (canvas.width / 960))}px var(--pixel-font)`;
+    ctx.fillText(SETTINGS.bubbleText, cx + bw/2, cy + bh/2 + 1);
+
+    ctx.restore();
+  }
+
+  // ===== Main loop =====
+  let last = performance.now();
+  function tick(now){
+    const dt = Math.min(0.033, (now-last)/1000);
+    last = now;
+
+    scene.update(dt);
+
+    // render world to low-res buffer
+    octx.clearRect(0,0,W,H);
+    scene.render(octx);
+
+    // scale up to main canvas (pixelated)
+    ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.drawImage(off, 0,0, canvas.width, canvas.height);
+
+    // draw crisp speech bubble on top in screen space (NOT blurry)
+    drawCrispSpeechBubble();
+
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+
+})();
+</script>
+</body>
+</html>
